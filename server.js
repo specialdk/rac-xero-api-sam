@@ -3805,7 +3805,7 @@ async function startServer() {
       console.log(
         `📊 Dashboard: ${
           process.env.NODE_ENV === "production"
-            ? "https://rac-xero-api-matt.up.railway.app"
+            ? "https://your-app.up.railway.app"
             : `http://localhost:${port}`
         }`
       );
