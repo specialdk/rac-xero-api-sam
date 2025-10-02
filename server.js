@@ -258,6 +258,7 @@ const xero = new XeroClient({
     "accounting.contacts",
     "accounting.settings",
     "accounting.reports.read",
+    "offline_access", // ADD THIS LINE
   ],
 });
 
@@ -890,8 +891,6 @@ const enhancedTokenStorage = {
         return { refreshed: 0, failed: 0, results: [] };
       }
 
-      console.log(`🔄 Found ${result.rows.length} tokens that need refreshing`);
-
       const refreshResults = [];
       let refreshed = 0;
       let failed = 0;
@@ -1121,7 +1120,6 @@ app.post("/api/trial-balance", async (req, res) => {
   }
 });
 
-// Cash Position endpoint
 app.post("/api/cash-position", async (req, res) => {
   try {
     const { organizationName, tenantId } = req.body;
@@ -1146,24 +1144,67 @@ app.post("/api/cash-position", async (req, res) => {
       }
     }
 
-    // Call your existing GET endpoint internally
-    const response = await fetch(
-      `${req.protocol}://${req.get("host")}/api/cash-position/${actualTenantId}`
-    );
-
-    if (!response.ok) {
-      throw new Error(`Cash position request failed: ${response.status}`);
+    // Get token and call Bank Summary report
+    const tokenData = await tokenStorage.getXeroToken(actualTenantId);
+    if (!tokenData) {
+      return res
+        .status(404)
+        .json({ error: "Tenant not found or token expired" });
     }
 
-    const result = await response.json();
-    res.json(result);
+    await xero.setTokenSet(tokenData);
+
+    // Use Bank Summary Report API for current balances
+    const response = await xero.accountingApi.getReportBankSummary(
+      actualTenantId
+    );
+
+    // Replace the existing Bank Summary parsing with this:
+    const bankSummaryRows = response.body.reports?.[0]?.rows || [];
+    const bankAccounts = [];
+    let totalCash = 0;
+
+    // Find the Section that contains the bank account rows
+    bankSummaryRows.forEach((row) => {
+      if (row.rowType === "Section" && row.rows) {
+        // Loop through each bank account row in the section
+        row.rows.forEach((bankRow) => {
+          if (
+            bankRow.rowType === "Row" &&
+            bankRow.cells &&
+            bankRow.cells.length >= 5
+          ) {
+            const accountName = bankRow.cells[0]?.value || "";
+            const closingBalance = parseFloat(bankRow.cells[4]?.value || 0); // Cell[4] = Closing Balance
+            const accountId =
+              bankRow.cells[0]?.attributes?.find(
+                (attr) => attr.id === "accountID"
+              )?.value || "";
+
+            if (accountName && !accountName.toLowerCase().includes("total")) {
+              bankAccounts.push({
+                name: accountName,
+                balance: closingBalance,
+                code: accountId,
+              });
+              totalCash += closingBalance;
+            }
+          }
+        });
+      }
+    });
+
+    res.json({
+      totalCash,
+      bankAccounts,
+    });
   } catch (error) {
     console.error("❌ Cash position API error:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Profit & Loss Summary endpoint
+// Also update the POST endpoint for P&L
 app.post("/api/profit-loss-summary", async (req, res) => {
   try {
     const { organizationName, tenantId, date, periodMonths } = req.body;
@@ -1188,11 +1229,14 @@ app.post("/api/profit-loss-summary", async (req, res) => {
       }
     }
 
-    // Call your existing GET endpoint internally
+    // Build parameters with updated defaults
     const params = new URLSearchParams();
     if (date) params.append("date", date);
-    if (periodMonths) params.append("periodMonths", periodMonths.toString());
-    const queryString = params.toString() ? `?${params.toString()}` : "";
+    // Default to 1 month instead of 12 for current month behavior
+    params.append("periodMonths", (periodMonths || 1).toString());
+    const queryString = params.toString()
+      ? `?${params.toString()}`
+      : "?periodMonths=1";
 
     const response = await fetch(
       `${req.protocol}://${req.get(
@@ -2658,6 +2702,337 @@ app.get("/dashboard", (req, res) => {
 });
 
 // ==============================================================================
+// YoY Analyst EndPoint
+// ==============================================================================
+// Year-over-Year Analysis endpoint - UPDATED TO USE 24 MONTHLY REPORTS
+app.get("/api/yoy-analysis/:tenantId", async (req, res) => {
+  try {
+    const tokenData = await tokenStorage.getXeroToken(req.params.tenantId);
+    if (!tokenData) {
+      return res
+        .status(404)
+        .json({ error: "Tenant not found or token expired" });
+    }
+
+    const reportDate = req.query.date || new Date().toISOString().split("T")[0];
+
+    await xero.setTokenSet(tokenData);
+
+    // Generate 24 monthly periods (current 12 months + previous 12 months)
+    const reportMonth = new Date(reportDate);
+    const currentYearPeriods = [];
+    const previousYearPeriods = [];
+
+    // Current year - 12 months ending with report month
+    for (let i = 11; i >= 0; i--) {
+      const monthDate = new Date(reportMonth);
+      monthDate.setMonth(reportMonth.getMonth() - i);
+
+      const monthStart = new Date(
+        monthDate.getFullYear(),
+        monthDate.getMonth(),
+        1
+      );
+      const monthEnd = new Date(
+        monthDate.getFullYear(),
+        monthDate.getMonth() + 1,
+        0
+      );
+
+      currentYearPeriods.push({
+        label: monthStart.toLocaleDateString("en-US", {
+          month: "short",
+          year: "numeric",
+        }),
+        startDate: monthStart.toISOString().split("T")[0],
+        endDate: monthEnd.toISOString().split("T")[0],
+      });
+    }
+
+    // Previous year - same 12 months but one year earlier
+    for (let i = 11; i >= 0; i--) {
+      const monthDate = new Date(reportMonth);
+      monthDate.setFullYear(reportMonth.getFullYear() - 1);
+      monthDate.setMonth(reportMonth.getMonth() - i);
+
+      const monthStart = new Date(
+        monthDate.getFullYear(),
+        monthDate.getMonth(),
+        1
+      );
+      const monthEnd = new Date(
+        monthDate.getFullYear(),
+        monthDate.getMonth() + 1,
+        0
+      );
+
+      previousYearPeriods.push({
+        label: monthStart.toLocaleDateString("en-US", {
+          month: "short",
+          year: "numeric",
+        }),
+        startDate: monthStart.toISOString().split("T")[0],
+        endDate: monthEnd.toISOString().split("T")[0],
+      });
+    }
+
+    // Function to get monthly P&L data
+    async function getMonthlyPLData(periods, periodLabel) {
+      let totalRevenue = 0;
+      let totalExpenses = 0;
+      const monthlyDetails = [];
+
+      for (const period of periods) {
+        try {
+          const response = await xero.accountingApi.getReportProfitAndLoss(
+            req.params.tenantId,
+            period.startDate,
+            period.endDate
+          );
+
+          const plRows = response.body.reports?.[0]?.rows || [];
+          const monthlyPL = parsePLData(plRows);
+
+          monthlyDetails.push({
+            ...period,
+            revenue: monthlyPL.totalRevenue,
+            expenses: monthlyPL.totalExpenses,
+            profit: monthlyPL.totalRevenue - monthlyPL.totalExpenses,
+          });
+
+          totalRevenue += monthlyPL.totalRevenue;
+          totalExpenses += monthlyPL.totalExpenses;
+        } catch (monthError) {
+          console.error(
+            `Error loading ${periodLabel} ${period.label}:`,
+            monthError.message
+          );
+          monthlyDetails.push({
+            ...period,
+            revenue: 0,
+            expenses: 0,
+            profit: 0,
+            error: monthError.message,
+          });
+        }
+      }
+
+      return {
+        totalRevenue,
+        totalExpenses,
+        totalProfit: totalRevenue - totalExpenses,
+        monthlyDetails,
+      };
+    }
+
+    // Get both periods in parallel
+    const [currentYearData, previousYearData] = await Promise.all([
+      getMonthlyPLData(currentYearPeriods, "Current"),
+      getMonthlyPLData(previousYearPeriods, "Previous"),
+    ]);
+
+    // Get trial balance data for asset/equity information
+    const [currentTBResponse, previousTBResponse] = await Promise.all([
+      fetch(
+        `${req.protocol}://${req.get("host")}/api/trial-balance/${
+          req.params.tenantId
+        }?date=${reportDate}`
+      ),
+      fetch(
+        `${req.protocol}://${req.get("host")}/api/trial-balance/${
+          req.params.tenantId
+        }?date=${previousYearPeriods[11].endDate}`
+      ),
+    ]);
+
+    let currentTB = null,
+      previousTB = null;
+    if (currentTBResponse.ok) {
+      currentTB = await currentTBResponse.json();
+    }
+    if (previousTBResponse.ok) {
+      previousTB = await previousTBResponse.json();
+    }
+
+    // Calculate YoY metrics using monthly totals
+    const yoyAnalysis = {
+      periods: {
+        current: {
+          label: `${currentYearPeriods[0].label.split(" ")[1]}-${
+            currentYearPeriods[11].label
+          }`,
+          start: currentYearPeriods[0].startDate,
+          end: currentYearPeriods[11].endDate,
+          revenue: currentYearData.totalRevenue,
+          expenses: currentYearData.totalExpenses,
+          profit: currentYearData.totalProfit,
+          assets: currentTB?.trialBalance?.totals?.totalAssets || 0,
+          equity: currentTB?.trialBalance?.totals?.totalEquity || 0,
+          monthlyBreakdown: currentYearData.monthlyDetails,
+        },
+        previous: {
+          label: `${previousYearPeriods[0].label.split(" ")[1]}-${
+            previousYearPeriods[11].label
+          }`,
+          start: previousYearPeriods[0].startDate,
+          end: previousYearPeriods[11].endDate,
+          revenue: previousYearData.totalRevenue,
+          expenses: previousYearData.totalExpenses,
+          profit: previousYearData.totalProfit,
+          assets: previousTB?.trialBalance?.totals?.totalAssets || 0,
+          equity: previousTB?.trialBalance?.totals?.totalEquity || 0,
+          monthlyBreakdown: previousYearData.monthlyDetails,
+        },
+      },
+      growth: {
+        revenue: calculateGrowthRate(
+          previousYearData.totalRevenue,
+          currentYearData.totalRevenue
+        ),
+        profit: calculateGrowthRate(
+          previousYearData.totalProfit,
+          currentYearData.totalProfit
+        ),
+        assets: calculateGrowthRate(
+          previousTB?.trialBalance?.totals?.totalAssets || 0,
+          currentTB?.trialBalance?.totals?.totalAssets || 0
+        ),
+        equity: calculateGrowthRate(
+          previousTB?.trialBalance?.totals?.totalEquity || 0,
+          currentTB?.trialBalance?.totals?.totalEquity || 0
+        ),
+      },
+      margins: {
+        current: calculateMargin(
+          currentYearData.totalRevenue,
+          currentYearData.totalProfit
+        ),
+        previous: calculateMargin(
+          previousYearData.totalRevenue,
+          previousYearData.totalProfit
+        ),
+      },
+    };
+
+    res.json({
+      tenantId: req.params.tenantId,
+      tenantName: tokenData.tenantName,
+      analysis: yoyAnalysis,
+      dataSource: "24 monthly P&L reports",
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Error getting YoY analysis with monthly reports:", error);
+    res.status(500).json({
+      error: "Failed to get YoY analysis",
+      details: error.message,
+    });
+  }
+});
+
+// Helper function to parse P&L data - reduced logs and improved
+function parsePLData(plRows) {
+  const plData = {
+    totalRevenue: 0,
+    totalExpenses: 0,
+    revenueAccounts: [],
+    expenseAccounts: [],
+  };
+
+  plRows.forEach((section) => {
+    if (section.rowType === "Section" && section.rows && section.title) {
+      const sectionTitle = section.title.toLowerCase();
+
+      section.rows.forEach((row) => {
+        if (row.rowType === "Row" && row.cells && row.cells.length >= 2) {
+          const accountName = row.cells[0]?.value || "";
+          const amount = parseFloat(row.cells[1]?.value || 0);
+
+          if (accountName.toLowerCase().includes("total") || amount === 0) {
+            return;
+          }
+
+          if (
+            sectionTitle.includes("income") ||
+            sectionTitle.includes("revenue") ||
+            sectionTitle.includes("trading")
+          ) {
+            plData.revenueAccounts.push({ name: accountName, amount });
+            plData.totalRevenue += amount; // Remove Math.abs()
+          } else if (
+            sectionTitle.includes("expense") ||
+            sectionTitle.includes("cost") ||
+            sectionTitle.includes("administration") ||
+            sectionTitle.includes("operating")
+          ) {
+            plData.expenseAccounts.push({ name: accountName, amount });
+            plData.totalExpenses += amount; // Remove Math.abs()
+          }
+        }
+      });
+    }
+  });
+
+  return plData;
+}
+
+// Helper function to calculate growth rate
+function calculateGrowthRate(previousValue, currentValue) {
+  if (previousValue === 0) {
+    return currentValue > 0 ? 100 : 0;
+  }
+  return ((currentValue - previousValue) / Math.abs(previousValue)) * 100;
+}
+
+// Helper function to calculate profit margin
+function calculateMargin(revenue, profit) {
+  return revenue > 0 ? (profit / revenue) * 100 : 0;
+}
+
+// POST wrapper for YoY Analysis
+app.post("/api/yoy-analysis", async (req, res) => {
+  try {
+    const { organizationName, tenantId, date } = req.body;
+
+    if (!organizationName && !tenantId) {
+      return res
+        .status(400)
+        .json({ error: "Organization name or tenant ID required" });
+    }
+
+    let actualTenantId = tenantId;
+    if (organizationName && !tenantId) {
+      const connections = await tokenStorage.getAllXeroConnections();
+      const connection = connections.find((c) =>
+        c.tenantName.toLowerCase().includes(organizationName.toLowerCase())
+      );
+      if (connection) {
+        actualTenantId = connection.tenantId;
+      } else {
+        return res.status(404).json({ error: "Organization not found" });
+      }
+    }
+
+    const dateParam = date ? `?date=${date}` : "";
+    const response = await fetch(
+      `${req.protocol}://${req.get(
+        "host"
+      )}/api/yoy-analysis/${actualTenantId}${dateParam}`
+    );
+
+    if (!response.ok) {
+      throw new Error(`YoY analysis request failed: ${response.status}`);
+    }
+
+    const result = await response.json();
+    res.json(result);
+  } catch (error) {
+    console.error("YoY analysis API error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==============================================================================
 // ENHANCED TRIAL BALANCE ENDPOINTS WITH DATE SUPPORT
 // ==============================================================================
 
@@ -2688,9 +3063,6 @@ app.get("/api/trial-balance/:tenantId", async (req, res) => {
     );
 
     const balanceSheetRows = balanceSheetResponse.body.reports?.[0]?.rows || [];
-    console.log(
-      `📊 Processing ${balanceSheetRows.length} Balance Sheet sections for ${reportDate}`
-    );
 
     // Initialize trial balance structure
     const trialBalance = {
@@ -2716,9 +3088,6 @@ app.get("/api/trial-balance/:tenantId", async (req, res) => {
     balanceSheetRows.forEach((section, sectionIndex) => {
       if (section.rowType === "Section" && section.rows && section.title) {
         const sectionTitle = section.title.toLowerCase();
-        console.log(
-          `🔄 Processing section: ${section.title} (${section.rows.length} rows)`
-        );
 
         section.rows.forEach((row) => {
           if (row.rowType === "Row" && row.cells && row.cells.length >= 2) {
@@ -2733,9 +3102,6 @@ app.get("/api/trial-balance/:tenantId", async (req, res) => {
             }
 
             processedAccounts++;
-            console.log(
-              `📈 Processing: ${accountName} = ${currentBalance.toLocaleString()}`
-            );
 
             const accountInfo = {
               name: accountName,
@@ -2815,14 +3181,19 @@ app.get("/api/trial-balance/:tenantId", async (req, res) => {
 
               if (
                 sectionTitle.includes("income") ||
-                sectionTitle.includes("revenue")
+                sectionTitle.includes("revenue") ||
+                sectionTitle.includes("trading") ||
+                sectionTitle.includes("sales") ||
+                sectionTitle.includes("property maintenance")
               ) {
                 accountInfo.credit = Math.abs(currentAmount);
                 trialBalance.revenue.push(accountInfo);
                 trialBalance.totals.totalRevenue += Math.abs(currentAmount);
               } else if (
                 sectionTitle.includes("expense") ||
-                sectionTitle.includes("cost")
+                sectionTitle.includes("cost") ||
+                sectionTitle.includes("administration") ||
+                sectionTitle.includes("operating")
               ) {
                 accountInfo.debit = Math.abs(currentAmount);
                 trialBalance.expenses.push(accountInfo);
@@ -3148,14 +3519,6 @@ app.get("/api/debug/simple/:tenantId", async (req, res) => {
     const allAccounts = response.body.accounts || [];
     const firstThree = allAccounts.slice(0, 3);
 
-    console.log("Raw Xero Response Structure:");
-    console.log("Total accounts:", allAccounts.length);
-    console.log(
-      "First account keys:",
-      firstThree[0] ? Object.keys(firstThree[0]) : "No accounts"
-    );
-    console.log("First account full:", firstThree[0]);
-
     res.json({
       message: "Raw Xero account data",
       totalAccounts: allAccounts.length,
@@ -3218,7 +3581,8 @@ function toggleSectionFromElement(element) {
 // ADDITIONAL FINANCIAL ANALYSIS ENDPOINTS
 // ============================================================================
 
-// Get Profit & Loss summary
+// Replace the existing profit-loss endpoint around line 1600
+// Get Profit & Loss summary - UPDATED WITH CURRENT MONTH DEFAULT
 app.get("/api/profit-loss/:tenantId", async (req, res) => {
   try {
     const tokenData = await tokenStorage.getXeroToken(req.params.tenantId);
@@ -3230,22 +3594,43 @@ app.get("/api/profit-loss/:tenantId", async (req, res) => {
 
     await xero.setTokenSet(tokenData);
 
+    // UPDATED DATE LOGIC - Default to current month
     const reportDate = req.query.date || new Date().toISOString().split("T")[0];
-    const periodMonths = parseInt(req.query.periodMonths) || 12;
+    const periodMonths = parseInt(req.query.periodMonths) || 1; // Default to 1 month instead of 12
 
-    // Calculate from date (start of period)
-    const fromDate = new Date(reportDate);
-    fromDate.setMonth(fromDate.getMonth() - periodMonths);
+    // Parse the report date properly
+    const reportEndDate = new Date(reportDate);
+    if (isNaN(reportEndDate.getTime())) {
+      return res.status(400).json({ error: "Invalid report date provided" });
+    }
+
+    // Calculate from date based on period months
+    let fromDate;
+    if (periodMonths === 1) {
+      // Current month - first day of current month
+      fromDate = new Date(
+        reportEndDate.getFullYear(),
+        reportEndDate.getMonth(),
+        1
+      );
+    } else {
+      // Multi-month period - go back the specified number of months
+      fromDate = new Date(reportEndDate);
+      fromDate.setMonth(fromDate.getMonth() - (periodMonths - 1));
+      fromDate.setDate(1);
+    }
+
     const fromDateStr = fromDate.toISOString().split("T")[0];
+    const actualReportDateStr = reportEndDate.toISOString().split("T")[0];
 
     console.log(
-      `Getting P&L for ${tokenData.tenantName} from ${fromDateStr} to ${reportDate}`
+      `P&L Date Range: ${fromDateStr} to ${actualReportDateStr} (${periodMonths} month period)`
     );
 
     const response = await xero.accountingApi.getReportProfitAndLoss(
       req.params.tenantId,
       fromDateStr,
-      reportDate
+      actualReportDateStr // Use this instead of reportDate
     );
 
     const plRows = response.body.reports?.[0]?.rows || [];
@@ -3254,10 +3639,10 @@ app.get("/api/profit-loss/:tenantId", async (req, res) => {
       totalRevenue: 0,
       totalExpenses: 0,
       netProfit: 0,
-      revenueAccounts: [],
-      expenseAccounts: [],
-      grossProfit: 0,
-      operatingExpenses: 0,
+      revenueSections: {}, // New: group by section
+      expenseSections: {}, // New: group by section
+      revenueAccounts: [], // Keep for compatibility
+      expenseAccounts: [], // Keep for compatibility
     };
 
     plRows.forEach((section) => {
@@ -3275,22 +3660,27 @@ app.get("/api/profit-loss/:tenantId", async (req, res) => {
 
             if (
               sectionTitle.includes("income") ||
-              sectionTitle.includes("revenue")
+              sectionTitle.includes("revenue") ||
+              sectionTitle.includes("property maintenance") ||
+              sectionTitle.includes("trading")
             ) {
               plSummary.revenueAccounts.push({
                 name: accountName,
-                amount: Math.abs(amount),
+                amount: amount,
               });
-              plSummary.totalRevenue += Math.abs(amount);
+              plSummary.totalRevenue += amount;
             } else if (
               sectionTitle.includes("expense") ||
-              sectionTitle.includes("cost")
+              sectionTitle.includes("cost") ||
+              sectionTitle.includes("administration") ||
+              sectionTitle.includes("operating") ||
+              sectionTitle.includes("salaries")
             ) {
               plSummary.expenseAccounts.push({
                 name: accountName,
-                amount: Math.abs(amount),
+                amount: amount,
               });
-              plSummary.totalExpenses += Math.abs(amount);
+              plSummary.totalExpenses += amount;
             }
           }
         });
@@ -3304,8 +3694,10 @@ app.get("/api/profit-loss/:tenantId", async (req, res) => {
       tenantName: tokenData.tenantName,
       period: {
         from: fromDateStr,
-        to: reportDate,
+        to: actualReportDateStr, // Use the hardcoded August 31st date
         months: periodMonths,
+        description:
+          periodMonths === 1 ? "Current Month" : `${periodMonths} Month Period`,
       },
       summary: plSummary,
       generatedAt: new Date().toISOString(),
@@ -3316,6 +3708,58 @@ app.get("/api/profit-loss/:tenantId", async (req, res) => {
       error: "Failed to get P&L summary",
       details: error.message,
     });
+  }
+});
+
+// Also update the POST endpoint for P&L
+app.post("/api/profit-loss-summary", async (req, res) => {
+  try {
+    const { organizationName, tenantId, date, periodMonths } = req.body;
+
+    if (!organizationName && !tenantId) {
+      return res
+        .status(400)
+        .json({ error: "Organization name or tenant ID required" });
+    }
+
+    // Find tenant ID if organization name provided
+    let actualTenantId = tenantId;
+    if (organizationName && !tenantId) {
+      const connections = await tokenStorage.getAllXeroConnections();
+      const connection = connections.find((c) =>
+        c.tenantName.toLowerCase().includes(organizationName.toLowerCase())
+      );
+      if (connection) {
+        actualTenantId = connection.tenantId;
+      } else {
+        return res.status(404).json({ error: "Organization not found" });
+      }
+    }
+
+    // Build parameters with updated defaults
+    const params = new URLSearchParams();
+    if (date) params.append("date", date);
+    // Default to 1 month instead of 12 for current month behavior
+    params.append("periodMonths", (periodMonths || 1).toString());
+    const queryString = params.toString()
+      ? `?${params.toString()}`
+      : "?periodMonths=1";
+
+    const response = await fetch(
+      `${req.protocol}://${req.get(
+        "host"
+      )}/api/profit-loss/${actualTenantId}${queryString}`
+    );
+
+    if (!response.ok) {
+      throw new Error(`P&L request failed: ${response.status}`);
+    }
+
+    const result = await response.json();
+    res.json(result);
+  } catch (error) {
+    console.error("❌ P&L summary API error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -3444,13 +3888,16 @@ app.get("/api/expense-analysis/:tenantId", async (req, res) => {
     const fromDateStr = fromDate.toISOString().split("T")[0];
 
     console.log(`Getting expense analysis for ${tokenData.tenantName}`);
-
     const response = await xero.accountingApi.getReportProfitAndLoss(
       req.params.tenantId,
       fromDateStr,
       reportDate
     );
 
+    console.log(
+      "P&L API call successful:",
+      response.body.reports?.[0] ? "YES" : "NO"
+    );
     const plRows = response.body.reports?.[0]?.rows || [];
 
     const expenseAnalysis = {
@@ -3473,7 +3920,7 @@ app.get("/api/expense-analysis/:tenantId", async (req, res) => {
               if (!accountName.toLowerCase().includes("total") && amount > 0) {
                 const expenseItem = {
                   accountName,
-                  amount: Math.abs(amount),
+                  amount: amount,
                   monthlyAverage: Math.abs(amount) / periodMonths,
                   category: categorizeExpense(accountName),
                 };
@@ -3792,6 +4239,309 @@ app.get("/api/financial-ratios/:tenantId", async (req, res) => {
       error: "Failed to calculate financial ratios",
       details: error.message,
     });
+  }
+});
+
+// ============================================================================
+// MONTHLY BREAKDOWN ENDPOINT (for Monthly Card reconciliation)
+// ============================================================================
+
+app.get("/api/monthly-breakdown/:tenantId", async (req, res) => {
+  try {
+    const tokenData = await tokenStorage.getXeroToken(req.params.tenantId);
+    if (!tokenData) {
+      return res
+        .status(404)
+        .json({ error: "Tenant not found or token expired" });
+    }
+
+    const reportDate = req.query.date || new Date().toISOString().split("T")[0];
+
+    console.log(
+      `📅 DEBUG: Starting monthly breakdown for ${tokenData.tenantName}`
+    );
+    console.log(`📅 DEBUG: Report date: ${reportDate}`);
+
+    // Use IDENTICAL date logic to YoY analysis
+    const currentPeriodEnd = new Date(reportDate);
+    const currentPeriodStart = new Date(currentPeriodEnd);
+    currentPeriodStart.setFullYear(currentPeriodEnd.getFullYear() - 1);
+    currentPeriodStart.setDate(currentPeriodStart.getDate() + 1);
+
+    console.log(
+      `📅 DEBUG: YoY period: ${
+        currentPeriodStart.toISOString().split("T")[0]
+      } to ${currentPeriodEnd.toISOString().split("T")[0]}`
+    );
+
+    // Calculate 12 complete calendar months ending with report month
+    const monthlyPeriods = [];
+    const reportMonth = new Date(reportDate);
+
+    for (let i = 11; i >= 0; i--) {
+      const monthDate = new Date(reportMonth);
+      monthDate.setMonth(reportMonth.getMonth() - i);
+
+      // Always use complete calendar month (1st to last day)
+      const monthStart = new Date(
+        monthDate.getFullYear(),
+        monthDate.getMonth(),
+        1
+      );
+      const monthEnd = new Date(
+        monthDate.getFullYear(),
+        monthDate.getMonth() + 1,
+        0
+      );
+
+      const monthStartStr = monthStart.toISOString().split("T")[0];
+      const monthEndStr = monthEnd.toISOString().split("T")[0];
+
+      monthlyPeriods.push({
+        monthIndex: i + 1,
+        label: monthStart.toLocaleDateString("en-US", {
+          month: "short",
+          year: "numeric",
+        }),
+        startDate: monthStartStr,
+        endDate: monthEndStr,
+        dayCount:
+          Math.ceil((monthEnd - monthStart) / (1000 * 60 * 60 * 24)) + 1,
+      });
+    }
+
+    console.log(
+      `DEBUG: Created ${monthlyPeriods.length} calendar month periods:`
+    );
+    monthlyPeriods.forEach((period, idx) => {
+      console.log(
+        `  Month ${idx + 1}: ${period.startDate} to ${period.endDate} (${
+          period.dayCount
+        } days) - ${period.label}`
+      );
+    });
+
+    await xero.setTokenSet(tokenData);
+
+    // Get monthly P&L data for each period
+    const monthlyData = [];
+    let totalRevenue = 0;
+    let totalExpenses = 0;
+
+    for (const period of monthlyPeriods) {
+      try {
+        console.log(
+          `📊 DEBUG: Fetching P&L for ${period.label} (${period.startDate} to ${period.endDate})`
+        );
+
+        const response = await xero.accountingApi.getReportProfitAndLoss(
+          req.params.tenantId,
+          period.startDate,
+          period.endDate
+        );
+
+        const plRows = response.body.reports?.[0]?.rows || [];
+        const monthlyPL = parsePLData(plRows);
+
+        monthlyData.push({
+          ...period,
+          revenue: monthlyPL.totalRevenue,
+          expenses: monthlyPL.totalExpenses,
+          netProfit: monthlyPL.totalRevenue - monthlyPL.totalExpenses,
+          revenueAccounts: monthlyPL.revenueAccounts.length,
+          expenseAccounts: monthlyPL.expenseAccounts.length,
+        });
+
+        totalRevenue += monthlyPL.totalRevenue;
+        totalExpenses += monthlyPL.totalExpenses;
+
+        console.log(
+          `  ✅ ${
+            period.label
+          }: Rev $${monthlyPL.totalRevenue.toLocaleString()}, Exp $${monthlyPL.totalExpenses.toLocaleString()}, Profit $${(
+            monthlyPL.totalRevenue - monthlyPL.totalExpenses
+          ).toLocaleString()}`
+        );
+      } catch (monthError) {
+        console.error(
+          `❌ ERROR loading month ${period.label}:`,
+          monthError.message
+        );
+
+        monthlyData.push({
+          ...period,
+          revenue: 0,
+          expenses: 0,
+          netProfit: 0,
+          revenueAccounts: 0,
+          expenseAccounts: 0,
+          error: monthError.message,
+        });
+      }
+    }
+
+    // Calculate totals for reconciliation
+    const monthlyTotals = {
+      totalRevenue,
+      totalExpenses,
+      totalNetProfit: totalRevenue - totalExpenses,
+    };
+
+    console.log(`📊 DEBUG: Monthly breakdown totals:`);
+    console.log(
+      `  Total Revenue: $${monthlyTotals.totalRevenue.toLocaleString()}`
+    );
+    console.log(
+      `  Total Expenses: $${monthlyTotals.totalExpenses.toLocaleString()}`
+    );
+    console.log(
+      `  Total Net Profit: $${monthlyTotals.totalNetProfit.toLocaleString()}`
+    );
+
+    // Get YoY data for reconciliation check
+    let yoyComparison = null;
+    try {
+      const yoyParams = req.query.date ? `?date=${req.query.date}` : "";
+      const yoyResponse = await fetch(
+        `${req.protocol}://${req.get("host")}/api/yoy-analysis/${
+          req.params.tenantId
+        }${yoyParams}`
+      );
+
+      if (yoyResponse.ok) {
+        const yoyData = await yoyResponse.json();
+        const currentPeriod = yoyData.analysis.periods.current;
+
+        yoyComparison = {
+          yoyRevenue: currentPeriod.revenue,
+          yoyExpenses: currentPeriod.revenue - currentPeriod.profit, // Calculate from revenue and profit
+          yoyNetProfit: currentPeriod.profit,
+
+          // Reconciliation checks
+          revenueVariance: monthlyTotals.totalRevenue - currentPeriod.revenue,
+          expenseVariance:
+            monthlyTotals.totalExpenses -
+            (currentPeriod.revenue - currentPeriod.profit),
+          profitVariance: monthlyTotals.totalNetProfit - currentPeriod.profit,
+
+          // Status flags
+          revenueReconciled:
+            Math.abs(monthlyTotals.totalRevenue - currentPeriod.revenue) < 100,
+          expenseReconciled:
+            Math.abs(
+              monthlyTotals.totalExpenses -
+                (currentPeriod.revenue - currentPeriod.profit)
+            ) < 100,
+          profitReconciled:
+            Math.abs(monthlyTotals.totalNetProfit - currentPeriod.profit) < 100,
+        };
+
+        console.log(`🔍 DEBUG: YoY Reconciliation Check:`);
+        console.log(
+          `  YoY Revenue: $${yoyComparison.yoyRevenue.toLocaleString()}, Monthly Sum: $${monthlyTotals.totalRevenue.toLocaleString()}, Variance: $${yoyComparison.revenueVariance.toLocaleString()}`
+        );
+        console.log(
+          `  YoY Profit: $${yoyComparison.yoyNetProfit.toLocaleString()}, Monthly Sum: $${monthlyTotals.totalNetProfit.toLocaleString()}, Variance: $${yoyComparison.profitVariance.toLocaleString()}`
+        );
+        console.log(
+          `  Revenue Reconciled: ${
+            yoyComparison.revenueReconciled ? "✅" : "❌"
+          }`
+        );
+        console.log(
+          `  Profit Reconciled: ${yoyComparison.profitReconciled ? "✅" : "❌"}`
+        );
+      }
+    } catch (yoyError) {
+      console.warn(
+        `⚠️ Could not fetch YoY data for reconciliation:`,
+        yoyError.message
+      );
+    }
+
+    res.json({
+      tenantId: req.params.tenantId,
+      tenantName: tokenData.tenantName,
+      reportDate,
+      period: {
+        start: currentPeriodStart.toISOString().split("T")[0],
+        end: currentPeriodEnd.toISOString().split("T")[0],
+        totalDays: Math.ceil(
+          (currentPeriodEnd - currentPeriodStart) / (1000 * 60 * 60 * 24)
+        ),
+      },
+      monthlyBreakdown: monthlyData,
+      totals: monthlyTotals,
+      yoyReconciliation: yoyComparison,
+      generatedAt: new Date().toISOString(),
+      debugInfo: {
+        monthlyPeriodsCount: monthlyPeriods.length,
+        errorMonths: monthlyData.filter((m) => m.error).length,
+        reconciliationStatus: yoyComparison
+          ? {
+              overall:
+                yoyComparison.revenueReconciled &&
+                yoyComparison.profitReconciled
+                  ? "RECONCILED"
+                  : "VARIANCE_DETECTED",
+              largestVariance: Math.max(
+                Math.abs(yoyComparison.revenueVariance || 0),
+                Math.abs(yoyComparison.profitVariance || 0)
+              ),
+            }
+          : "YOY_DATA_UNAVAILABLE",
+      },
+    });
+  } catch (error) {
+    console.error("❌ ERROR in monthly breakdown:", error);
+    res.status(500).json({
+      error: "Failed to get monthly breakdown",
+      details: error.message,
+      tenantId: req.params.tenantId,
+    });
+  }
+});
+
+// POST wrapper for Monthly Breakdown
+app.post("/api/monthly-breakdown", async (req, res) => {
+  try {
+    const { organizationName, tenantId, date } = req.body;
+
+    if (!organizationName && !tenantId) {
+      return res
+        .status(400)
+        .json({ error: "Organization name or tenant ID required" });
+    }
+
+    let actualTenantId = tenantId;
+    if (organizationName && !tenantId) {
+      const connections = await tokenStorage.getAllXeroConnections();
+      const connection = connections.find((c) =>
+        c.tenantName.toLowerCase().includes(organizationName.toLowerCase())
+      );
+      if (connection) {
+        actualTenantId = connection.tenantId;
+      } else {
+        return res.status(404).json({ error: "Organization not found" });
+      }
+    }
+
+    const dateParam = date ? `?date=${date}` : "";
+    const response = await fetch(
+      `${req.protocol}://${req.get(
+        "host"
+      )}/api/monthly-breakdown/${actualTenantId}${dateParam}`
+    );
+
+    if (!response.ok) {
+      throw new Error(`Monthly breakdown request failed: ${response.status}`);
+    }
+
+    const result = await response.json();
+    res.json(result);
+  } catch (error) {
+    console.error("❌ Monthly breakdown API error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
